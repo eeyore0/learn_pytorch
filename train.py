@@ -1,5 +1,4 @@
-# train.py (版本 9 - 实施分块训练)
-
+# train.py (版本 10.1 - 完整且修正的版本)
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -8,6 +7,7 @@ import numpy as np
 import cv2
 import os
 import json
+import random
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 import albumentations as A
@@ -18,13 +18,15 @@ from unet_model import UNet
 
 # --- 1. 定义超参数和配置 ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-LEARNING_RATE = 1e-4
-BATCH_SIZE = 6 # 分块后数据量大增，可以适当增加Batch Size
-NUM_EPOCHS = 100 # 需要更多的轮数来学习
-PATCH_SIZE = 256 # 定义图块大小
+LEARNING_RATE = 0.001
+BATCH_SIZE = 6
+NUM_EPOCHS = 30
+PATCH_SIZE = 256
 TEST_SPLIT = 0.1
 VAL_SPLIT = 0.1
-IMAGE_TYPE_TO_TRAIN = 'DM'
+NEGATIVE_SAMPLE_RATIO = 0.5
+
+IMAGE_TYPE_TO_TRAIN = 'CM'
 
 ANNOTATIONS_CSV_PATH = "PKG-CDD-CESM/Radiology_hand_drawn_segmentations_v2.csv"
 if IMAGE_TYPE_TO_TRAIN == 'DM':
@@ -60,21 +62,20 @@ def dice_coefficient(preds, targets, smooth=1e-6):
     return (2. * intersection + smooth) / (preds.sum() + targets.sum() + smooth)
 
 
-# --- 2. 创建自定义数据集类 (完全重构以实现分块) ---
-# --- 2. 创建自定义数据集类 (已修正) ---
+# --- 2. 创建自定义数据集类 (已补全) ---
 class CDD_CESM_Patch_Dataset(Dataset):
-    # +++ 修正：__init__ 接收 full_annotations_df +++
     def __init__(self, annotations_df: pd.DataFrame, full_annotations_df: pd.DataFrame, img_dir: str, patch_size: int,
                  augmentations=None):
         self.img_dir = img_dir
         self.patch_size = patch_size
         self.augmentations = augmentations
-        self.full_annotations = full_annotations_df  # 存储完整的标注信息
+        self.full_annotations = full_annotations_df
         self.patches = self._create_patches(annotations_df)
 
     def _create_patches(self, df):
         patch_list = []
-        for _, row in tqdm(df.iterrows(), total=df.shape[0], desc=f"Creating Patches for {len(df)} annotations"):
+        desc = f"Creating Positive Patches for {len(df)} annotations"
+        for _, row in tqdm(df.iterrows(), total=df.shape[0], desc=desc):
             img_name = row['#filename']
             try:
                 region = json.loads(row['region_shape_attributes'])
@@ -83,12 +84,61 @@ class CDD_CESM_Patch_Dataset(Dataset):
                 patch_list.append({'name': img_name, 'center_x': center_x, 'center_y': center_y})
             except (json.JSONDecodeError, KeyError):
                 continue
-        print(f"创建了 {len(patch_list)} 个正样本图块。")
+
+        num_positive_patches = len(patch_list)
+        print(f"创建了 {num_positive_patches} 个正样本图块。")
+
+        num_negative_to_add = int(num_positive_patches * NEGATIVE_SAMPLE_RATIO)
+        all_image_files = df['#filename'].unique()
+
+        image_masks = {}
+        for img_name in all_image_files:
+            same_img_annotations = self.full_annotations[self.full_annotations['#filename'] == img_name]
+            temp_img_path = os.path.join(self.img_dir, img_name)
+            temp_img = cv2.imread(temp_img_path, cv2.IMREAD_GRAYSCALE)
+            if temp_img is None: continue
+
+            full_mask = np.zeros(temp_img.shape, dtype=np.uint8)
+            for _, row in same_img_annotations.iterrows():
+                try:
+                    region = json.loads(row['region_shape_attributes'])
+                    points = np.array(list(zip(region['all_points_x'], region['all_points_y'])), dtype=np.int32)
+                    cv2.fillPoly(full_mask, [points], 255)
+                except:
+                    continue
+            image_masks[img_name] = full_mask
+
+        negative_patches_added = 0
+        desc_neg = f"Creating {num_negative_to_add} Negative Patches"
+        with tqdm(total=num_negative_to_add, desc=desc_neg) as pbar:
+            while negative_patches_added < num_negative_to_add:
+                img_name = random.choice(all_image_files)
+                if img_name not in image_masks: continue
+
+                full_mask = image_masks[img_name]
+                h, w = full_mask.shape
+
+                rand_center_x = random.randint(self.patch_size // 2, w - self.patch_size // 2)
+                rand_center_y = random.randint(self.patch_size // 2, h - self.patch_size // 2)
+
+                half_patch = self.patch_size // 2
+                y1, y2 = rand_center_y - half_patch, rand_center_y + half_patch
+                x1, x2 = rand_center_x - half_patch, rand_center_x + half_patch
+
+                if np.sum(full_mask[y1:y2, x1:x2]) == 0:
+                    patch_list.append({'name': img_name, 'center_x': rand_center_x, 'center_y': rand_center_y})
+                    negative_patches_added += 1
+                    pbar.update(1)
+
+        print(f"添加了 {negative_patches_added} 个负样本图块。总图块数: {len(patch_list)}")
+        random.shuffle(patch_list)
         return patch_list
 
+    # +++ 补全：__len__ 方法 +++
     def __len__(self):
         return len(self.patches)
 
+    # +++ 补全：__getitem__ 方法 +++
     def __getitem__(self, idx):
         patch_info = self.patches[idx]
         img_name = patch_info['name']
@@ -127,13 +177,7 @@ class CDD_CESM_Patch_Dataset(Dataset):
             image = augmented['image']
             mask = augmented['mask']
 
-        # +++ THIS IS THE FIX +++
-        # The error indicates that the 'image' tensor is a ByteTensor (uint8).
-        # We must explicitly convert it to a FloatTensor before returning.
-        # Note: ToTensorV2 should have already scaled values to [0,1],
-        # so we only need to change the data type.
         image = image.float()
-
         mask = mask.float()
         mask[mask > 0] = 1.0
 
@@ -141,6 +185,7 @@ class CDD_CESM_Patch_Dataset(Dataset):
             mask = mask.unsqueeze(0)
 
         return image, mask
+
 
 def train_fn(loader, model, optimizer, loss_fn):
     model.train()
@@ -182,16 +227,13 @@ def evaluate_fn(loader, model, loss_fn, desc="Validation"):
     return avg_loss, avg_dice
 
 
-# --- 4. 主执行函数 (已更新) ---
 def main():
     train_augs = A.Compose([
-        # A.Resize(PATCH_SIZE, PATCH_SIZE) # 不再需要Resize，因为我们直接提取该尺寸的块
         A.Rotate(limit=15, p=0.5),
         A.HorizontalFlip(p=0.5),
         ToTensorV2(),
     ])
     val_augs = A.Compose([
-        # A.Resize(PATCH_SIZE, PATCH_SIZE)
         ToTensorV2(),
     ])
 
@@ -207,7 +249,6 @@ def main():
     val_df, test_df = train_test_split(temp_df, test_size=(TEST_SPLIT / (TEST_SPLIT + VAL_SPLIT)), random_state=42)
     print(f"总标注数: {len(filtered_df)} | 训练集: {len(train_df)} | 验证集: {len(val_df)} | 测试集: {len(test_df)}")
 
-    # +++ 修正：将 full_df 传递给Dataset +++
     train_dataset = CDD_CESM_Patch_Dataset(train_df, full_df, IMAGE_ROOT_DIR, PATCH_SIZE, train_augs)
     val_dataset = CDD_CESM_Patch_Dataset(val_df, full_df, IMAGE_ROOT_DIR, PATCH_SIZE, val_augs)
     test_dataset = CDD_CESM_Patch_Dataset(test_df, full_df, IMAGE_ROOT_DIR, PATCH_SIZE, val_augs)
@@ -220,7 +261,7 @@ def main():
     loss_fn = DiceBCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=3)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, verbose=True)  # 增加patience
 
     best_val_dice = -1.0
     model_save_path = f"best_model_{IMAGE_TYPE_TO_TRAIN}.pth"
